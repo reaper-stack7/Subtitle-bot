@@ -89,7 +89,7 @@ SPEED_MSG = (
 SETTINGS_MSG = (
     "⚙️ **Subtitle Formatting Settings**\n\n"
     "Subtitle formatting is pre-configured for optimal readability and timing.\n\n"
-    "*Designed by SRIRAM S*"
+    "*Designed by hi S*"
 )
 
 
