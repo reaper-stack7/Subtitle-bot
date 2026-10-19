@@ -1,0 +1,996 @@
+﻿# ======================================================================
+# SRM TAMIL REAPER – OPUS-MT ENGLISH -> TAMIL SUBTITLE BOT (FINAL)
+# ======================================================================
+# RUN THESE IN A COLAB/KAGGLE CELL FIRST:
+!apt-get update -qq && apt-get install -y -qq ffmpeg
+!pip install -q pyrogram tgcrypto faster-whisper nest_asyncio transformers sentencepiece langdetect
+
+
+import os
+import asyncio
+import json
+import math
+import re
+import sys
+import time
+import nest_asyncio
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import RPCError, MessageNotModified
+from transformers import MarianTokenizer, MarianMTModel
+import torch
+from faster_whisper import WhisperModel
+from langdetect import detect
+
+
+nest_asyncio.apply()
+
+
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
+ALLOWED_USERS = []  # e.g., [123456789, 987654321]
+
+
+API_ID = 30088220
+API_HASH = "c42d40e6ff0696672743dc431fe1c2e3"
+BOT_TOKEN = "8832706348:AAEgiS2HEjEIDpgs0db2x5wlsSuoaxB6UmQ"
+
+
+if API_ID == 123456 or "your_" in API_HASH.lower() or BOT_TOKEN == "your_bot_token":
+    sys.exit("❌ Replace API_ID, API_HASH, and BOT_TOKEN with your credentials.")
+
+
+MODEL_SIZE = "distil-large-v3"
+DOWNLOAD_DIR = "./downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+processing_lock = asyncio.Lock()
+bot_start_time = time.time()
+
+
+SUBTITLE_OFFSET = 0.12
+MAX_CHARS_PER_LINE = 38
+MAX_CPS = 20.0
+CPS_EXTENSION_LIMIT = 1.5
+END_PADDING = 0.15
+MIN_DURATION = 1.0
+MAX_DURATION = 7.0
+FRAME_GAP = 0.08
+MAX_SILENCE_GAP = 0.4
+
+
+# ======================================================================
+# MESSAGE CONSTANTS
+# ======================================================================
+START_MSG = (
+    "👋 **Welcome to SRM Tamil Reaper!**\n\n"
+    "I turn your videos, audio, and subtitle files into perfectly timed "
+    "**Tamil subtitles (.srt)** in just a few seconds.\n\n"
+    "🚀 **What I do:**\n"
+    "• Extract English subtitles automatically\n"
+    "• Transcribe audio with AI (if no subtitles exist)\n"
+    "• Translate English to Tamil\n\n"
+    "📤 Just send me a file and let me work!\n\n"
+    "*Developed by SRIRAM S*"
+)
+
+
+SPEED_MSG = (
+    "⚡ **Speed & Hardware Specs**\n\n"
+    "• **Processor:** `NVIDIA T4 GPU (or CPU fallback)`\n"
+    "• **Transcription Engine:** `Whisper distil-large-v3`\n"
+    "• **Translation Engine:** `Opus-MT (en-dra)`\n"
+    "• **Batch Size:** `256 lines at once` (fast & stable)\n"
+    "• **Speed:** `~10–15x Real-Time`\n\n"
+    "*Optimized by SRIRAM S*"
+)
+
+
+SETTINGS_MSG = (
+    "⚙️ **Subtitle Formatting Settings**\n\n"
+    "Subtitle formatting is pre-configured for optimal readability and timing.\n\n"
+    "*Designed by SRIRAM S*"
+)
+
+
+HELP_MSG = (
+    "📖 **How to Use Me**\n\n"
+    "1️⃣ **Send any file** – video, audio, or subtitle file (`.srt` / `.ass`).\n"
+    "2️⃣ **Wait a few seconds** – I'll extract, transcribe, and translate.\n"
+    "3️⃣ **Download** – I'll send you a clean `.srt` file with Tamil subtitles.\n\n"
+    "*Made with ❤️ by SRIRAM S*"
+)
+
+
+ABOUT_MSG = (
+    "ℹ️ **About This Bot**\n\n"
+    "• **Name:** `SRM TAMIL REAPER`\n"
+    "• **Developer:** `SRIRAM S`\n"
+    "• **Purpose:** Automatic English → Tamil subtitle translation\n"
+    "• **Output:** `.srt` – works on VLC, MX Player, and all media players\n\n"
+    "**© SRIRAM S**"
+)
+
+
+# ======================================================================
+# HELPERS
+# ======================================================================
+def format_srt_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = round((seconds % 1) * 1000)
+    if millis == 1000:
+        millis = 999
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def format_eta(seconds: float) -> str:
+    if seconds <= 0 or math.isinf(seconds):
+        return "00s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}h {m:02d}m {s:02d}s" if h > 0 else f"{m:02d}m {s:02d}s"
+
+
+async def safe_edit(message, text, reply_markup=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        print(f"Edit error: {e}")
+
+
+async def pyrogram_progress(current, total, status_msg, action_text, start_time, last_update_ref):
+    now = time.time()
+    if now - last_update_ref["time"] < 2.0 and current != total:
+        return
+    last_update_ref["time"] = now
+    elapsed_time = max(now - start_time, 0.001)
+    percentage = (current / total) * 100
+    bar = "█" * int(percentage // 10) + "░" * (10 - int(percentage // 10))
+    speed_mbps = (current / (1024 * 1024)) / elapsed_time
+    current_mb, total_mb = current / (1024 * 1024), total / (1024 * 1024)
+    eta_seconds = ((total - current) / (current / elapsed_time)) if current > 0 else 0
+    progress_str = (
+        f"{action_text}\n`[{bar}] {percentage:.1f}%`\n"
+        f"- Size: `{current_mb:.1f} MB / {total_mb:.1f} MB`\n"
+        f"- Speed: `{speed_mbps:.2f} MB/s`\n"
+        f"- ETA: `{format_eta(eta_seconds)}`"
+    )
+    try:
+        await safe_edit(status_msg, progress_str)
+    except:
+        pass
+
+
+def simple_progress(percent, length=10):
+    filled = int(percent * length / 100)
+    return "█" * filled + "░" * (length - filled) + f" {percent:.0f}%"
+
+
+# ======================================================================
+# LOAD MODELS
+# ======================================================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️ Using device: {device}")
+
+
+print("🔄 Loading Opus-MT (English→Tamil) using en-dra...")
+opus_model_name = "Helsinki-NLP/opus-mt-en-dra"
+opus_tokenizer = MarianTokenizer.from_pretrained(opus_model_name, token=False)
+opus_model = MarianMTModel.from_pretrained(
+    opus_model_name,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+).to(device)
+print("✅ Opus-MT loaded.")
+
+
+print("🔄 Loading Whisper distil-large-v3...")
+whisper = WhisperModel(MODEL_SIZE, device=device, compute_type="float16" if device == "cuda" else "int8")
+print("✅ Whisper loaded.")
+
+
+# ======================================================================
+# TEXT CLEANING & LANGUAGE HELPERS
+# ======================================================================
+def clean_text(text):
+    if not text:
+        return ""
+    text = text.replace("\\N", " ").replace("\\n", " ").replace("\r", " ").replace("\t", " ")
+    text = re.sub(r"\{[^}]*\}", "", text)
+    text = re.sub(r"<[^>]*>", "", text)
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"[@#$%^&*()=+/\\|`~\"<>{}[\]]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_japanese(text):
+    return bool(re.search(r'[\u3040-\u30FF]', text))
+
+
+def detect_subtitle_language(text_sample: str) -> str:
+    if not text_sample:
+        return "en"
+    if is_japanese(text_sample):
+        return "ja"
+    try:
+        lang = detect(text_sample)
+        return lang if lang in {"en", "ja", "ko", "zh", "es", "fr", "de", "it", "pt", "ru", "ar", "hi", "ta", "te", "ml", "bn", "vi", "th"} else "unknown"
+    except Exception:
+        return "unknown"
+
+
+# ======================================================================
+# SUBTITLE PARSING (SRT and ASS) – BOM‑aware
+# ======================================================================
+def ass_time_to_sec(t: str) -> float:
+    t = t.replace(".", ":")
+    h, m, s, cs = t.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s) + int(cs) / 100
+
+
+def parse_srt(path):
+    blocks = []
+    with open(path, encoding="utf-8-sig") as f:
+        content = f.read().strip()
+    for block in content.split("\n\n"):
+        lines = block.split("\n")
+        if len(lines) >= 3:
+            raw = " ".join(lines[2:]).strip()
+            clean = clean_text(raw)
+            if clean:
+                try:
+                    t1, t2 = lines[1].replace(",", ".").split(" --> ")
+                    h1, m1, s1 = t1.strip().split(":")
+                    start_sec = int(h1) * 3600 + int(m1) * 60 + float(s1)
+                    h2, m2, s2 = t2.strip().split(":")
+                    end_sec = int(h2) * 3600 + int(m2) * 60 + float(s2)
+                    blocks.append((start_sec, end_sec, clean))
+                except Exception:
+                    try:
+                        t1, t2 = lines[1].replace(",", ".").split(" --> ")
+                        start_sec = ass_time_to_sec(t1)
+                        end_sec = ass_time_to_sec(t2)
+                        blocks.append((start_sec, end_sec, clean))
+                    except Exception:
+                        continue
+    return blocks
+
+
+def parse_ass(path):
+    blocks = []
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            if line.startswith("Dialogue:"):
+                parts = line.split(",", 9)
+                if len(parts) >= 10:
+                    start_str = parts[1].strip()
+                    end_str = parts[2].strip()
+                    raw_text = parts[9].strip()
+                    clean = clean_text(raw_text)
+                    if clean:
+                        try:
+                            start_sec = ass_time_to_sec(start_str)
+                            end_sec = ass_time_to_sec(end_str)
+                            blocks.append((start_sec, end_sec, clean))
+                        except Exception:
+                            continue
+    return blocks
+
+
+# ======================================================================
+# YOUR ORIGINAL ALIGNMENT LOGIC (UNCHANGED – KEPT EXACTLY AS YOU PASTED)
+# ======================================================================
+def _find_best_split(words, cpl):
+    """
+    Priority order:
+      1. After sentence-ending punctuation (. ? !), remainder >= 3 words
+      2. After comma/semicolon, remainder >= 3 words
+      3. Before conjunctions, both sides >= 2 words
+      4. Weak-word avoidance + best length balance
+      5. Balanced midpoint fallback
+    """
+    total_words = len(words)
+    if total_words <= 2:
+        return 1
+
+
+    for i in range(1, total_words - 1):
+        if words[i - 1].endswith(('.', '?', '!')):
+            if total_words - i >= 3:
+                return i
+
+
+    for i in range(1, total_words - 1):
+        if words[i - 1].endswith((',', ';')):
+            if total_words - i >= 3:
+                return i
+
+
+    conjunctions = {"and", "but", "because", "or", "so", "for", "nor", "yet"}
+    for i in range(1, total_words - 1):
+        if words[i].lower() in conjunctions:
+            if i >= 2 and total_words - i >= 3:
+                return i
+
+
+    weak_words = {
+        "that", "to", "of", "for", "with", "on", "at", "by", "from", "up",
+        "into", "upon", "without", "through", "during", "including", "within",
+        "which", "whose", "whom", "where", "when", "why", "how", "than", "as", "like"
+    }
+    best_split = None
+    best_balance = float('inf')
+    for i in range(2, total_words - 2):
+        prev_word = words[i - 1].lower().strip('.,;!?')
+        next_word = words[i].lower().strip('.,;!?')
+        if prev_word not in weak_words and next_word not in weak_words:
+            first_len = sum(len(w) for w in words[:i]) + (i - 1)
+            second_len = sum(len(w) for w in words[i:]) + (total_words - i - 1)
+            balance = abs(first_len - second_len) / max(first_len, second_len, 1)
+            if balance < best_balance:
+                best_balance = balance
+                best_split = i
+    if best_split is not None and best_balance < 0.3:
+        return best_split
+
+
+    mid = total_words // 2
+    return max(1, min(mid, total_words - 1))
+
+
+def _split_oversized_word(word, word_start, word_end, max_len):
+    total_len = len(word)
+    if total_len <= max_len:
+        return [(word, word_start, word_end)]
+
+
+    duration = max(word_end - word_start, 0.001)
+    parts = []
+    pos = 0
+    while total_len - pos > max_len:
+        chunk_len = max_len - 1
+        chunk_text = word[pos:pos + chunk_len] + "-"
+        frac_start = pos / total_len
+        frac_end = (pos + chunk_len) / total_len
+        chunk_start = word_start + duration * frac_start
+        chunk_end = word_start + duration * frac_end
+        parts.append((chunk_text, chunk_start, chunk_end))
+        pos += chunk_len
+
+
+    frac_start = pos / total_len
+    chunk_start = word_start + duration * frac_start
+    parts.append((word[pos:], chunk_start, word_end))
+    return parts
+
+
+def create_balanced_srt_blocks(
+    segments,
+    max_chars_per_line=MAX_CHARS_PER_LINE,
+    max_silence_gap=MAX_SILENCE_GAP,
+):
+    blocks = []
+    current_words = []
+    current_len = 0
+    start_time = None
+    last_word_end = 0.0
+
+
+    for segment in segments:
+        for word_info in segment.words:
+            raw_word = word_info.word.strip()
+            if not raw_word:
+                continue
+
+
+            if last_word_end > 0 and (word_info.start - last_word_end) > max_silence_gap:
+                if current_words:
+                    full_text = " ".join(current_words)
+                    blocks.append((start_time, last_word_end, full_text))
+                    current_words = []
+                    current_len = 0
+                    start_time = None
+
+
+            if start_time is None:
+                start_time = word_info.start
+
+
+            if len(raw_word) > max_chars_per_line:
+                chunks = _split_oversized_word(
+                    raw_word, word_info.start, word_info.end, max_chars_per_line
+                )
+                if current_words:
+                    full_text = " ".join(current_words)
+                    blocks.append((start_time, last_word_end, full_text))
+                    current_words = []
+                    current_len = 0
+
+
+                for chunk_text, chunk_start, chunk_end in chunks[:-1]:
+                    blocks.append((chunk_start, chunk_end, chunk_text))
+
+
+                last_text, last_start, last_end = chunks[-1]
+                start_time = last_start
+                current_words = [last_text]
+                current_len = len(last_text)
+                last_word_end = last_end
+                continue
+
+
+            word = raw_word
+            word_len = len(word)
+
+
+            if current_words and (current_len + word_len + 1 > max_chars_per_line):
+                split_idx = _find_best_split(current_words, max_chars_per_line)
+                first_line = " ".join(current_words[:split_idx])
+                second_line = " ".join(current_words[split_idx:])
+
+
+                first_word_second = second_line.split()[0] if second_line else ""
+                if first_word_second and first_word_second.lower() not in {"and", "but", "because", "or", "so", "for", "nor", "yet"}:
+                    second_line = second_line[0].upper() + second_line[1:] if len(second_line) > 1 else second_line.upper()
+
+
+                final_text = first_line + "\\N" + second_line
+                blocks.append((start_time, last_word_end, final_text))
+
+
+                current_words = [word]
+                current_len = len(word)
+                start_time = word_info.start
+                last_word_end = word_info.end
+                continue
+            else:
+                current_words.append(word)
+                current_len += word_len + (1 if len(current_words) > 1 else 0)
+
+
+            last_word_end = word_info.end
+
+
+    if current_words:
+        full_text = " ".join(current_words)
+        blocks.append((start_time, last_word_end, full_text))
+    return blocks
+
+
+def apply_timing_rules(blocks):
+    if not blocks:
+        return blocks
+
+
+    adjusted = []
+    for start, end, text in blocks:
+        start += SUBTITLE_OFFSET
+        end += SUBTITLE_OFFSET
+        raw_dur = end - start
+        if raw_dur <= 0:
+            raw_dur = 0.5
+            end = start + raw_dur
+
+
+        visible_text = text.replace("\\N", " ").strip()
+        char_count = len(visible_text)
+        cps = char_count / raw_dur if raw_dur > 0 else 0
+        if cps > MAX_CPS:
+            ideal_duration = char_count / MAX_CPS
+            extension = ideal_duration - raw_dur
+            if extension > CPS_EXTENSION_LIMIT:
+                extension = CPS_EXTENSION_LIMIT
+            end += extension
+
+
+        end += END_PADDING
+        dur = end - start
+        if dur < MIN_DURATION:
+            end = start + MIN_DURATION
+        if dur > MAX_DURATION:
+            end = start + MAX_DURATION
+
+
+        adjusted.append([start, end, text])
+
+
+    for i in range(1, len(adjusted)):
+        prev_end = adjusted[i - 1][1]
+        curr_start = adjusted[i][0]
+        if curr_start < prev_end + FRAME_GAP:
+            adjusted[i][0] = prev_end + FRAME_GAP
+        curr_start = adjusted[i][0]
+        curr_end = adjusted[i][1]
+        if curr_end - curr_start < MIN_DURATION:
+            adjusted[i][1] = curr_start + MIN_DURATION
+        if curr_end - curr_start > MAX_DURATION:
+            adjusted[i][1] = curr_start + MAX_DURATION
+
+
+    for i, (s, e, t) in enumerate(adjusted):
+        if s >= e:
+            adjusted[i][1] = s + MIN_DURATION
+
+
+    return [(s, e, t) for s, e, t in adjusted]
+
+
+# ======================================================================
+# TRANSLATION ENGINE (OPUS-MT)
+# ======================================================================
+async def translate_opus(texts, lang_code, status):
+    if not texts:
+        return texts
+    filtered = [t for t in texts if t.strip()]
+    if not filtered:
+        return texts
+
+
+    if lang_code not in ["en", "eng"]:
+        await safe_edit(status, "⚠️ Opus-MT only supports English. Bypassing translation...")
+        return texts
+
+
+    chunk_size = 256
+    total = len(filtered)
+    translated = []
+
+
+    for i in range(0, total, chunk_size):
+        chunk = filtered[i:i + chunk_size]
+        if not chunk:
+            continue
+        try:
+            tagged = [f">>tam<< {t}" for t in chunk]
+            inputs = opus_tokenizer(tagged, return_tensors="pt", padding=True, truncation=True, max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            def sync_generate():
+                with torch.no_grad():
+                    return opus_model.generate(**inputs, max_length=512, num_beams=1, do_sample=False)
+            outputs = await asyncio.to_thread(sync_generate)
+            decoded = opus_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            cleaned = [line.replace(">>tam<<", "").strip() for line in decoded]
+            translated.extend(cleaned)
+        except Exception as e:
+            print(f"⚠️ Opus-MT error on chunk: {e}")
+            translated.extend([f"[UNTRANSLATED] {t}" for t in chunk])
+
+
+        percent = min(100, (i + len(chunk)) * 100 // total)
+        await safe_edit(status, f"🌐 Translating (EN→TA Opus-MT)... \n`[{simple_progress(percent)}]`")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+    if len(translated) < len(filtered):
+        print(f"⚠️ Translation length mismatch: {len(translated)} vs {len(filtered)}. Padding...")
+        while len(translated) < len(filtered):
+            idx = len(translated)
+            translated.append(f"[UNTRANSLATED] {filtered[idx]}")
+    elif len(translated) > len(filtered):
+        translated = translated[:len(filtered)]
+
+
+    result = []
+    idx = 0
+    for t in texts:
+        if t.strip():
+            result.append(translated[idx])
+            idx += 1
+        else:
+            result.append(t)
+    return result
+
+
+# ======================================================================
+# SMART SUBTITLE EXTRACTION (SCAN ALL TRACKS, PICK FIRST ENGLISH)
+# ======================================================================
+async def extract_embedded_subtitle_smart(input_file: str, output_srt: str) -> bool:
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_file]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stdout, _ = await proc.communicate()
+    if not stdout.strip():
+        return False
+    data = json.loads(stdout.decode())
+
+
+    sub_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "subtitle"]
+    if not sub_streams:
+        return False
+
+
+    # FIX: if format duration is missing, read from streams
+    video_duration = float(data.get("format", {}).get("duration", 0))
+    if video_duration == 0:
+        for s in data.get("streams", []):
+            d = float(s.get("duration", 0))
+            if d > video_duration:
+                video_duration = d
+
+
+    # Track candidates: we want long tracks (full dialogue) that are English
+    english_candidates = []
+
+
+    for stream in sub_streams:
+        lang = stream.get("tags", {}).get("language", "").lower()
+        codec = stream.get("codec_name", "").lower()
+        if codec not in ["subrip", "ass", "mov_text", "srt", "ssa"]:
+            continue
+
+
+        idx = str(stream.get("index"))
+        temp_srt = output_srt.replace(".srt", f"_temp_{idx}.srt")
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", input_file, "-map", f"0:{idx}", "-c:s", "srt", temp_srt]
+        ffmpeg_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await ffmpeg_proc.wait()
+
+
+        if not os.path.exists(temp_srt):
+            continue
+
+
+        blocks = parse_srt(temp_srt)
+        line_count = len(blocks)
+        duration_covered = 0
+        if blocks:
+            first_start = blocks[0][0]
+            last_end = blocks[-1][1]
+            duration_covered = last_end - first_start
+
+
+        try:
+            os.remove(temp_srt)
+        except:
+            pass
+
+
+        # Filter: must be long (> 100 lines) and cover > 10% of video
+        if line_count < 100:
+            continue
+        if video_duration > 0 and (duration_covered / video_duration) < 0.1:
+            continue
+
+
+        # Check language of this track
+        sample = " ".join([b[2] for b in blocks[:20]])
+        detected = detect_subtitle_language(sample)
+
+
+        print(f"🔍 Track {idx}: {line_count} lines, {detected}")
+
+
+        if detected == "en":
+            # Found an English track! Use it.
+            print(f"✅ Selected English track {idx}")
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", input_file, "-map", f"0:{idx}", "-c:s", "srt", output_srt]
+            ffmpeg_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await ffmpeg_proc.wait()
+            return os.path.exists(output_srt)
+
+
+    # No English track found
+    return False
+
+
+async def extract_best_audio_track(input_file: str, output_wav: str) -> str:
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_file]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stdout, _ = await proc.communicate()
+    if not stdout.strip():
+        raise RuntimeError("❌ FFprobe failed to read file.")
+    data = json.loads(stdout.decode())
+
+
+    audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        raise RuntimeError("❌ No audio streams detected.")
+
+
+    selected_stream = "0:a:0"
+    for idx, stream in enumerate(audio_streams):
+        lang = stream.get("tags", {}).get("language", "").lower()
+        if lang in ["eng", "en", "english"]:
+            selected_stream = f"0:a:{idx}"
+            break
+
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", input_file, "-map", selected_stream,
+        "-ac", "1", "-ar", "16000",
+        "-af", "dynaudnorm",
+        "-c:a", "pcm_s16le", output_wav
+    ]
+    ffmpeg_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    await ffmpeg_proc.wait()
+    return output_wav
+
+
+# ======================================================================
+# MAIN HANDLER
+# ======================================================================
+app = Client("srm_reaper", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+
+
+@app.on_message(filters.private & (filters.document | filters.video | filters.audio | filters.voice))
+async def handle_media(client, message):
+    if message.from_user is None:
+        await message.reply_text("❌ I don't process messages from channels.")
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised to use this bot.")
+        return
+
+
+    if message.document:
+        mime = message.document.mime_type or ""
+        if (not any(mime.startswith(a) for a in ["video/", "audio/"]) and
+                mime not in ["text/plain", "text/x-srt", "application/x-subrip", "text/vtt"]):
+            await message.reply_text("❌ Unsupported file type. Send a video, audio, or subtitle file.")
+            return
+
+
+    name = getattr(message.document or message.video or message.audio or message.voice, "file_name", "media.mp4")
+    name = os.path.basename(name)
+    ext = name.split(".")[-1].lower()
+
+
+    status = await message.reply_text("⏳ Queued...")
+    async with processing_lock:
+        path = wav = out_path = srt_out = None
+        try:
+            clean_name = re.sub(r"[^\w\.-]", "_", name)
+            path = os.path.join(DOWNLOAD_DIR, clean_name)
+
+
+            path = await message.download(
+                file_name=path,
+                progress=pyrogram_progress,
+                progress_args=(status, "📥 **Downloading media...**", time.time(), {"time": 0.0})
+            )
+
+
+            blocks = []
+            detected_lang = "en"
+            is_translated = True
+
+
+            if ext in ["srt", "ass"]:
+                blocks = parse_srt(path) if ext == "srt" else parse_ass(path)
+                sample = " ".join([b[2] for b in blocks[:20]])
+                detected_lang = detect_subtitle_language(sample)
+                await safe_edit(status, f"📄 Parsed {ext.upper()} – detected: {detected_lang.upper()}")
+            else:
+                wav = os.path.join(DOWNLOAD_DIR, f"audio_{message.id}.wav")
+                srt_out = os.path.join(DOWNLOAD_DIR, f"extracted_{message.id}.srt")
+
+
+                await safe_edit(status, "🔍 Scanning all subtitle tracks...")
+                has_subs = await extract_embedded_subtitle_smart(path, srt_out)
+
+
+                if has_subs:
+                    blocks = parse_srt(srt_out)
+                    detected_lang = "en"  # We already filtered for English in the extraction
+                    await safe_edit(status, f"✅ English subtitle track found ({len(blocks)} lines). Fast-tracking...")
+                else:
+                    await safe_edit(status, "🎧 No English subtitles found. Extracting audio...")
+                    await extract_best_audio_track(path, wav)
+
+
+                    await safe_edit(status, "🎤 Transcribing with Whisper (auto-detect)...")
+                    def transcribe_sync():
+                        return whisper.transcribe(
+                            wav,
+                            task="transcribe",
+                            language=None,
+                            beam_size=1,
+                            word_timestamps=True,
+                            vad_filter=True,
+                            condition_on_previous_text=False,
+                            vad_parameters=dict(
+                                threshold=0.1,
+                                min_speech_duration_ms=200,
+                                min_silence_duration_ms=300,
+                                speech_pad_ms=300,
+                            )
+                        )
+                    segments, info = await asyncio.to_thread(transcribe_sync)
+                    detected_lang = info.language
+
+
+                    await safe_edit(status, "📝 Formatting text & timings...")
+                    raw_blocks = create_balanced_srt_blocks(segments)
+                    blocks = apply_timing_rules(raw_blocks)
+
+
+            if not blocks:
+                await safe_edit(status, "⚠️ No speech or text detected.")
+                return
+
+
+            texts = [t for _, _, t in blocks]
+            if detected_lang in ["en", "eng"]:
+                translated = await translate_opus(texts, detected_lang, status)
+                is_translated = True
+            else:
+                translated = texts
+                is_translated = False
+
+
+            base = os.path.splitext(name)[0]
+            server_name = f"{base}_{message.id}_Tamil.srt" if is_translated else f"{base}_{message.id}_Untranslated_{detected_lang.upper()}.srt"
+            display_name = f"{base}_Tamil.srt" if is_translated else f"{base}_Untranslated_{detected_lang.upper()}.srt"
+            out_path = os.path.join(DOWNLOAD_DIR, server_name)
+
+
+            with open(out_path, "w", encoding="utf-8-sig") as f:
+                f.write("1\n00:00:00,010 --> 00:00:03,000\n@The_shadow_society\n\n")
+                f.write("2\n00:00:03,010 --> 00:00:06,000\nDesigned by SRIRAM S\n\n")
+                for idx, (s, e, _) in enumerate(blocks, 3):
+                    t = translated[idx - 3] if idx - 3 < len(translated) else ""
+                    if t:
+                        # FIX: Convert \N to actual newline for SRT (fixes horizontal stretching)
+                        srt_text = t.replace("{", "(").replace("}", ")")
+                        lines = srt_text.split("\\N")
+                        final_text = "\n".join(lines)
+                        f.write(f"{idx}\n{format_srt_timestamp(s)} --> {format_srt_timestamp(e)}\n{final_text}\n\n")
+
+
+            caption = (
+                f"📄 **{display_name}** (Tamil translation)" if is_translated
+                else f"📄 **{display_name}** (⚠️ Untranslated – language: {detected_lang.upper()} — OPUS-MT only supports English)"
+            )
+            await safe_edit(status, "📤 Uploading...")
+            await message.reply_document(
+                out_path,
+                caption=caption,
+                progress=pyrogram_progress,
+                progress_args=(status, "📤 **Uploading SRT file...**", time.time(), {"time": 0.0})
+            )
+
+
+        except Exception as e:
+            print(f"❌ Error processing file: {e}")
+            await safe_edit(status, "❌ An error occurred while processing your file. Please try again later.")
+        finally:
+            for p in [path, wav, out_path, srt_out]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except:
+                        pass
+            try:
+                await status.delete()
+            except:
+                pass
+
+
+# ======================================================================
+# UI
+# ======================================================================
+def get_start_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Speed & Hardware", callback_data="btn_speed"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="btn_settings"),
+        ],
+        [
+            InlineKeyboardButton("📖 How to Use", callback_data="btn_help"),
+            InlineKeyboardButton("ℹ️ About Engine", callback_data="btn_about"),
+        ],
+    ])
+
+
+def get_back_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="btn_start")]]
+    )
+
+
+@app.on_message(filters.private & filters.command("start"))
+async def start_handler(client, message):
+    if message.date.timestamp() < bot_start_time:
+        return
+    if message.from_user is None:
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised.")
+        return
+    await message.reply_text(START_MSG, reply_markup=get_start_keyboard())
+
+
+@app.on_message(filters.private & filters.command("speed"))
+async def speed_handler(client, message):
+    if message.date.timestamp() < bot_start_time:
+        return
+    if message.from_user is None:
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised.")
+        return
+    await message.reply_text(SPEED_MSG, reply_markup=get_back_keyboard())
+
+
+@app.on_message(filters.private & filters.command("settings"))
+async def settings_handler(client, message):
+    if message.date.timestamp() < bot_start_time:
+        return
+    if message.from_user is None:
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised.")
+        return
+    await message.reply_text(SETTINGS_MSG, reply_markup=get_back_keyboard())
+
+
+@app.on_message(filters.private & filters.command("help"))
+async def help_handler(client, message):
+    if message.date.timestamp() < bot_start_time:
+        return
+    if message.from_user is None:
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised.")
+        return
+    await message.reply_text(HELP_MSG, reply_markup=get_back_keyboard())
+
+
+@app.on_message(filters.private & filters.command("about"))
+async def about_handler(client, message):
+    if message.date.timestamp() < bot_start_time:
+        return
+    if message.from_user is None:
+        return
+    if ALLOWED_USERS and message.from_user.id not in ALLOWED_USERS:
+        await message.reply_text("❌ You are not authorised.")
+        return
+    await message.reply_text(ABOUT_MSG, reply_markup=get_back_keyboard())
+
+
+@app.on_callback_query()
+async def callback_handler(client, callback_query: CallbackQuery):
+    data = callback_query.data
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await callback_query.message.edit_text("❌ You are not authorised.")
+        return
+    try:
+        if data == "btn_start":
+            await callback_query.message.edit_text(START_MSG, reply_markup=get_start_keyboard())
+        elif data == "btn_speed":
+            await callback_query.message.edit_text(SPEED_MSG, reply_markup=get_back_keyboard())
+        elif data == "btn_settings":
+            await callback_query.message.edit_text(SETTINGS_MSG, reply_markup=get_back_keyboard())
+        elif data == "btn_help":
+            await callback_query.message.edit_text(HELP_MSG, reply_markup=get_back_keyboard())
+        elif data == "btn_about":
+            await callback_query.message.edit_text(ABOUT_MSG, reply_markup=get_back_keyboard())
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        print(f"Callback Exception: {e}")
+
+
+# ======================================================================
+# START
+# ======================================================================
+async def main():
+    await app.start()
+    print("\n" + "=" * 50)
+    print("🤖 SRM TAMIL REAPER ONLINE (FINAL)")
+    print("=" * 50 + "\n")
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped.")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
